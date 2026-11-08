@@ -1,0 +1,280 @@
+= Отчёт по лабораторной работе №3 Кашапова Владимира Максимовича
+
+== Цель работы
+
+Освоить приёмы объектно-ориентированного проектирования встраиваемого
+ПО на C++: выделение интерфейсов, применение шаблонов, реализация
+нескольких сменяемых режимов работы светодиодной индикации на
+микроконтроллере STM32 без изменения основной программы.
+
+== Задание
+
+На базе ранее написанного кода управления группой светодиодов через
+`Pin`/`Led` реализовать последовательную смену режимов индикации:
+
+. В течение *10 секунд* — «бегущий огонь» (`Blink`).
+. В течение *10 секунд* — «ёлочка» (`Tree`).
+. В течение *10 секунд* — «шахматка» (`Chess`).
+. Далее цикл повторяется.
+
+При этом:
+
+* режимы должны быть оформлены как отдельные классы, реализующие
+  общий интерфейс `IMode`;
+* основная программа (`main`) не должна знать о конкретных режимах —
+  работать только через указатель на `IMode`;
+* количество светодиодов и количество режимов должно задаваться
+  константами-шаблонными параметрами, без «магических чисел» в логике.
+
+== Используемое оборудование и ПО
+
+* Отладочная плата с STM32 (тактирование от HSI, 16 МГц).
+* Светодиоды, подключённые к пинам:
+  ** `GPIOA` — пин 5;
+  ** `GPIOC` — пины 5, 8, 9.
+* Компилятор C++ (arm-none-eabi-g++), среда разработки CLion / Qt Creator.
+* Библиотеки работы с регистрами `rccregisters.hpp`,
+  `gpioaregisters.hpp`, а также классы `Pin`, `Led`.
+
+== Ход работы
+
+=== Этап 1. Базовое мигание всех светодиодов
+
+Исходный код переключал все светодиоды одновременно: все загорались —
+пауза — все гасли — пауза. Использовалась функция `delay()`,
+представляющая собой пустой цикл:
+
+[source,cpp]
+----
+void delay(int cycles)
+{
+  for (int i = 0; i < cycles; ++i)
+  {
+    asm volatile ("");
+  }
+}
+----
+
+Светодиоды описаны через шаблон `Pin<...>` и объединены в массив
+указателей `std::array<IPin*, N>`. В `main` в бесконечном цикле
+перебирались все пины и вызывался `Toggle()`.
+
+=== Этап 2. Чередование режимов «ёлочка» / «все вместе»
+
+На следующем шаге требовалось получить следующее поведение:
+
+* 10 секунд — «ёлочка» (пины загораются по одному);
+* 10 секунд — «все вместе» (все пины переключаются одновременно).
+
+Для этого цикл `while (1)` был разбит на две фазы, каждая из которых
+ограничена счётчиком итераций:
+
+[source,cpp]
+----
+while (1)
+{
+  // 10 секунд "ёлочка"
+  for (std::uint32_t i = 0; i < DELAYS_PER_10S / pinsCount; ++i)
+  {
+    for (auto pin : pins)
+    {
+      pin->Toggle();
+      delay(DELAY_CYCLES);
+    }
+  }
+
+  // 10 секунд "все вместе"
+  for (std::uint32_t i = 0; i < DELAYS_PER_10S; ++i)
+  {
+    for (auto pin : pins)
+    {
+      pin->Toggle();
+    }
+    delay(DELAY_CYCLES);
+  }
+}
+----
+
+[NOTE]
+====
+Функция `delay(cycles)` не калибрована: она выполняет ровно `cycles`
+пустых итераций, и фактическая длительность зависит от оптимизации
+компилятора, тактирования и архитектуры. Поэтому длительность фазы
+«10 секунд» подбирается коэффициентом `DELAYS_PER_10S`, а более
+корректным решением является отсчёт через SysTick или аппаратный
+таймер (`delay_ms()` с опорой на `SystemCoreClock`).
+====
+
+=== Этап 3. Оптимизация через ООП
+
+Чтобы избежать «размазывания» логики по `main`, режимы были вынесены
+в отдельные классы, реализующие общий интерфейс `IMode`.
+
+==== Интерфейс IMode
+
+[source,cpp]
+----
+class IMode
+{
+public:
+    virtual ~IMode() = default;
+
+    virtual void Work() = 0;
+    virtual void Init() = 0;
+};
+----
+
+`Init()` — приводит светодиоды в начальное состояние режима
+(вызывается один раз при переключении на режим).
+`Work()` — выполняет один шаг режима (вызывается циклически с
+задержкой).
+
+==== Режим ModeBlink — «бегущий огонь» / общее мигание
+
+[source,cpp]
+----
+template <std::size_t Size>
+class ModeBlink final : public IMode
+{
+public:
+  explicit ModeBlink(const std::array<ILed*, Size>& leds)
+    : leds(leds) {}
+
+  void Init() override
+  {
+    for (ILed* led : leds) led->Light();
+  }
+
+  void Work() override
+  {
+    for (auto led : leds) led->Toggle();
+  }
+
+private:
+  const std::array<ILed*, Size>& leds;
+};
+----
+
+==== Режим ModeTree — «ёлочка»
+
+[source,cpp]
+----
+template <std::size_t Size>
+class ModeTree final : public IMode
+{
+public:
+    explicit ModeTree(const std::array<ILed*, Size>& leds)
+        : leds(leds), step(0U) {}
+
+    void Init() override
+    {
+        for (auto led : leds) led->Light();
+        step = 0U;
+    }
+
+    void Work() override
+    {
+        if (step == Size) step = 0;
+        leds[step]->Toggle();
+        ++step;
+    }
+
+private:
+    const std::array<ILed*, Size>& leds;
+    std::size_t step;
+};
+----
+
+==== Режим ModeChess — «шахматка»
+
+[source,cpp]
+----
+template <std::size_t Size>
+class ModeChess final : public IMode
+{
+public:
+    explicit ModeChess(const std::array<ILed*, Size>& leds)
+        : leds(leds) {}
+
+    void Init() override
+    {
+        for (auto led : leds) led->Light();
+        for (std::size_t i = 1; i < Size; i += 2)
+            leds[i]->Toggle(); // оставляем горящими только чётные
+    }
+
+    void Work() override
+    {
+        for (auto led : leds) led->Toggle();
+    }
+
+private:
+    const std::array<ILed*, Size>& leds;
+};
+----
+
+==== Основная программа
+
+[source,cpp]
+----
+Pin<GPIOC::ODR, 5> pin5;
+Pin<GPIOC::ODR, 8> pin8;
+Pin<GPIOC::ODR, 9> pin9;
+Pin<GPIOA::ODR, 5> pin5a;
+
+Led led1(pin5a);
+Led led2(pin9);
+Led led3(pin8);
+
+constexpr std::uint32_t ledsCount  = 3U;
+std::array<ILed*, ledsCount> leds  = {&led1, &led2, &led3};
+
+ModeBlink<ledsCount>  modeBlink(leds);
+ModeTree <ledsCount>  modeTree(leds);
+ModeChess<ledsCount>  modeChess(leds);
+
+constexpr std::uint32_t modesCount = 3U;
+std::array<IMode*, modesCount> modes = {&modeBlink, &modeTree, &modeChess};
+
+constexpr std::uint32_t DELAYS_PER_10S = 100U;
+
+int main(void)
+{
+  RCC::AHB1ENR::GPIOAEN::Enable::Set();
+  RCC::AHB1ENR::GPIOCEN::Enable::Set();
+
+  GPIOA::MODER::MODER5::Output::Set();
+  GPIOC::MODER::MODER5::Output::Set();
+  GPIOC::MODER::MODER8::Output::Set();
+  GPIOC::MODER::MODER9::Output::Set();
+
+  std::uint32_t modeNumber = 0;
+
+  while (1)
+  {
+    for (std::uint32_t i = 0; i < DELAYS_PER_10S / ledsCount; ++i)
+    {
+      modes[modeNumber]->Work();
+      delay(1000000);
+    }
+    modeNumber = (modeNumber + 1) % modesCount;
+    modes[modeNumber]->Init();
+  }
+}
+----
+
+== Вывод
+
+В ходе лабораторной работы:
+
+* реализован базовый драйвер мигания группой светодиодов;
+* получено чередование режимов «ёлочка» / «все вместе»;
+* произведена оптимизация архитектуры за счёт выделения интерфейса
+  `IMode` и отдельных классов-режимов (`ModeBlink`, `ModeTree`,
+  `ModeChess`);
+* основная программа стала независимой от конкретных режимов —
+  добавление нового режима сводится к созданию нового класса,
+  реализующего `IMode`, и его регистрации в массиве `modes`;
+
+В результате система последовательно отображает три режима индикации
+по 10 секунд каждый, циклически повторяя их.
